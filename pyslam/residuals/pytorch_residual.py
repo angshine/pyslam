@@ -77,6 +77,8 @@ class PhotometricReisdual(TorchResidual):
             pose_se3 = SE3(SO3(frame["pose_gt"][:, :3].float()), frame["pose_gt"][:, 3].float()).log()
         elif pose_init == "ones":
             pose_se3 = torch.ones(6).float()
+        elif pose_init == "random":
+            pose_se3 = torch.tensor(np.random.random(6)).float()
         else:
             raise NotImplementedError(f"pose_init = {pose_init} not supported yet.")
         return pose_se3
@@ -157,6 +159,45 @@ class PhotometricReisdual(TorchResidual):
         kp2ds_pose = self.get_pose_kp2ds(pose_SE3)
         pose_gt_SE3 = SE3(SO3(frame["pose_gt"][:, :3].float()), frame["pose_gt"][:, 3].float())
         kp2ds_gt_pose = self.get_pose_kp2ds(pose_gt_SE3)
-        metric = ((kp2ds_pose - kp2ds_gt_pose) ** 2).sum()
+        metric = ((kp2ds_pose - kp2ds_gt_pose) ** 2).sum().detach()
         return metric
 
+
+class PnPResidual(TorchResidual):
+    def __init__(self, frame, stiffness):
+        super(PnPResidual, self).__init__(stiffness)
+        self.frame = frame
+        self.K = frame["K"].float()
+        self.kp3ds = frame["kpt_3d"].T.float()
+        self.kp2ds = frame["kpt_2d"].T.float()
+        self.n_kps = self.kp3ds.shape[1]
+        self.pose_se3 = SE3(SO3(torch.eye(3).float()), torch.zeros(1, 3).float()).log()
+        self.residual_sum = None
+
+    def eval_func(self, params):
+        self.pose_se3 = params[0]
+        pose_SE3 = SE3.exp(self.pose_se3)
+        kp2ds_pose = self.kp2ds_by_kp3ds(pose_SE3)
+        pnp_residual = (kp2ds_pose - self.kp2ds).view(-1)
+        self.residual_sum = (pnp_residual ** 2).sum()
+        return pnp_residual
+
+    def kp2ds_by_kp3ds(self, pose_SE3, detach=False):
+        """ Get keypoints calculated by the given pose and self.kp3ds
+        """
+        pose_kp3d = pose_SE3.rot.as_matrix() @ self.kp3ds + pose_SE3.trans.unsqueeze(-1)
+        pose_kp3d_norm = self.K @ pose_kp3d  # [3, 9]
+        _pose_kp3d_norm = pose_kp3d_norm.detach() if detach else pose_kp3d_norm.clone()
+        _pose_kp3d_norm[0, :] = pose_kp3d_norm[0, :] / pose_kp3d_norm[-1, :]
+        _pose_kp3d_norm[1, :] = pose_kp3d_norm[1, :] / pose_kp3d_norm[-1, :]
+        return _pose_kp3d_norm[:2, :]  # [2, N]
+
+    def calc_ADD(self):
+        """ Not actually the ADD metric, calculate (l2-norm)^2 instead of l1-norm.
+        """
+        pose_SE3 = SE3.exp(self.pose_se3)
+        kp2ds_pose = self.kp2ds_by_kp3ds(pose_SE3)
+        pose_gt_SE3 = SE3(SO3(self.frame["pose_gt"][:, :3].float()), self.frame["pose_gt"][:, 3].float())
+        kp2ds_gt_pose = self.kp2ds_by_kp3ds(pose_gt_SE3)
+        metric = ((kp2ds_pose - kp2ds_gt_pose) ** 2).sum().detach()
+        return metric
