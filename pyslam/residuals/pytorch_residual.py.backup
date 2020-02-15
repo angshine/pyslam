@@ -1,0 +1,41 @@
+import numpy as np
+import torch
+from pyslam.torch_utils import calc_jacobian
+
+
+class TorchResidual:
+    """ General class using pytorch to calculate residual and utilize pytorch's automatic
+    differentiation to calculate jacobian matrix.
+    """
+
+    def __init__(self, torch_func, stiffness):
+        """
+        Args:
+            torch_func: function | function/method that utilizing pytorch to calculate residual
+                        given current parameters value.
+            stiffness: numpy.ndarray | stiffness matrix of parameters to be optimized
+                       i.e. sqrt(inv(CovMatrix))
+        """
+        self.eval_func = torch_func
+        self.stiffness = stiffness
+
+    def evaluate(self, params, compute_jacobians=None, callbacks=None):
+        # TODO: add callbacks to do logging and other things...
+        torch_params = torch.tensor(params[0], dtype=torch.float32, requires_grad=True)
+        torch_res = self.eval_func(torch_params)
+        np_res = torch_res.detach().numpy()
+
+        if compute_jacobians:
+            jacobians = [None for _ in enumerate(params)]
+
+            if compute_jacobians[0]:
+                n_params = torch_params.shape[0]
+                n_res = torch_res.shape[0]
+                torch_jac = calc_jacobian(torch_res, torch_params, False)  # [n_res, n_param]
+                np_jac = torch_jac.detach().numpy()
+                assert np_jac.shape == (n_res, n_params)
+                jacobians[0] = np.dot(self.stiffness, np_jac)
+
+                return np_res, jacobians
+
+        return np_res

@@ -47,10 +47,11 @@ class Problem:
         self.param_dict = dict()
         """Dictionary of all parameters with their current values."""
 
+        # 以下3个list的存储内容是一一对应的
         self.residual_blocks = []
         """List of residual blocks."""
-        self.block_param_keys = []
-        """List of parameter keys in param_dict that each block depends on."""
+        self.block_param_keys = []  # list of lists
+        """List of parameter keys(key only, without value) in param_dict that each block depends on."""
         self.block_loss_functions = []
         """List of loss functions applied to each block. Default: L2Loss."""
 
@@ -70,7 +71,12 @@ class Problem:
             """Thread pool for parallel evaluations."""
 
     def add_residual_block(self, block, param_keys, loss=L2Loss()):
-        """Add a cost block to the problem."""
+        """Add a cost block to the problem.
+        Args:
+            block: ResidualBlock | residual block that specifies how to evaluate residual and calculate jacobian
+            param_keys: List | list of parameter keys (names)
+            loss: Loss | loss that put upon the residual
+        """
         # param_keys must be a list, but don't force the user to create a
         # 1-element list
         if isinstance(param_keys, str):
@@ -81,12 +87,17 @@ class Problem:
         self.block_loss_functions.append(loss)
 
     def initialize_params(self, param_dict):
-        """Initialize the parameters in the problem."""
+        """Initialize the parameters in the problem.
+        Args:
+            param_dict: dict | a dictionary of all the parameters the problem relied on.
+                        keys should be the same as in add_residual_block, values are the initialization.
+        """
         # update does a shallow copy, which is no good for immutable parameters
         self.param_dict.update(copy.deepcopy(param_dict))
 
     def set_parameters_constant(self, param_keys):
-        """Hold a list of parameters constant."""
+        """Hold a list of parameters constant.
+        Notice that parameters are set variable by default. This method only take effect on variables"""
         # param_keys must be a list, but don't force the user to create a
         # 1-element list
         if isinstance(param_keys, str):
@@ -108,7 +119,12 @@ class Problem:
                 self.constant_param_keys.remove(key)
 
     def eval_cost(self, param_dict=None):
-        """Evaluate the cost function using given parameter values."""
+        """Evaluate the cost function using given parameter values.
+        Args:
+            param_dict: dict | dict of parameters with the values to be evaluated
+        Returns:
+            cost: scalar | the sum of loss of all residual_blocks
+        """
         if param_dict is None:
             param_dict = self.param_dict
 
@@ -121,7 +137,7 @@ class Problem:
             except KeyError as e:
                 print(
                     "Parameter {} has not been initialized".format(e.args[0]))
-
+            # import pdb; pdb.set_trace()
             residual = block.evaluate(params)
             cost += np.sum(loss.loss(residual))
 
@@ -142,9 +158,10 @@ class Problem:
 
         while not done_optimization:
             optimization_iters += 1
-            prev_cost = cost
+            prev_cost = cost  # scalar value
 
-            dx, cost = self.solve_one_iter()
+            # compute update value
+            dx, cost = self.solve_one_iter()  # dx is a list of delta-updates of all variables
             # print("Update vector:\n", str(dx))
             # print("Update norm = %f" % np.linalg.norm(dx))
 
@@ -152,8 +169,9 @@ class Problem:
             self._cost_history.append(cost)
 
             # Update parameters
-            for k, r in self._update_partition_dict.items():
-                self._perturb_by_key(k, dx[r])
+            for k, r in self._update_partition_dict.items():  # r is range instance
+                # self.param
+                self._perturb_by_key(k, dx[r])  # update the variable
 
             # Check if done optimizing
             done_optimization = optimization_iters > self.options.max_iters or \
@@ -181,7 +199,7 @@ class Problem:
 
     def solve_one_iter(self):
         """Solve one iteration of Gauss-Newton."""
-        # precision * dx = information
+        # precision * dx = information, scalar cost summing over all residuals
         precision, information, cost = self._get_precision_information_and_cost()
         dx = splinalg.spsolve(precision, information)
 
@@ -250,7 +268,21 @@ class Problem:
         return summary
 
     def _get_update_partition_dict(self):
-        """Helper function to partition the full update vector."""
+        """Helper function to partition the full update vector.
+        Param in self.param_dict corresponding to various parameters to be optimized (e.g. se(3) has 6 DoF).
+        This method specify each param's dimensions indices (by range) in the final dx vector.
+
+        Args:
+        Returns:
+            update_partition_dict: dict | dict of variable params keeping original param's key
+                                   with value the range of dofs in all parameters
+                        e.g.
+                            {"pose1": range(0, 6),
+                             "pose2": range(6, 12),
+                             "landmark1": range(12, 15),
+                             ......}
+                        then, dx[range(0, 6)] is the delta-updates of pose1
+        """
         update_partition_dict = {}
         prev_key = ''
         for key, param in self.param_dict.items():
@@ -277,36 +309,41 @@ class Problem:
         return update_partition_dict
 
     def _get_precision_information_and_cost(self):
-        """Helper function to build the precision matrix and information vector for the Gauss - Newton update. Also returns the total cost."""
+        """
+        Helper function to build the precision matrix and information vector for the Gauss - Newton update.
+        Also returns the total cost.
+        """
         # The Gauss-Newton step is given by
-        # (H.T * W * H) dx = -H.T * W * e
+        # (H.T * W * H) dx = -H.T * W * e  (H is the jacobian matrix)
         # or
         # precision * dx = information
         #
         # However, in our case, W is subsumed into H and e by the stiffness parameter
         # so instead we have
         # (H'.T * H') dx = -H'.T * e'
-        # where H' = sqrt(W) * H and e' = sqrt(W) * e
+        # where H' = sqrt(W) * H and e' = sqrt(W) * e  (W is always a diagonal matrix ?)
         #
         # Note that this is an exactly equivalent formulation, but avoids needing
         # to explicitly construct and multiply the (possibly very large) W
         # matrix.
+
+        # 首先创建大的jacobian矩阵, 其中会有稀疏结构,这里只是先初始化为None
         HT_blocks = [[None for _ in self.residual_blocks]
-                     for _ in self.param_dict]
-        e_blocks = [None for _ in self.residual_blocks]
-        cost_blocks = [None for _ in self.residual_blocks]
+                     for _ in self.param_dict]   # param_dict中的每个待优化param关于所有residual_blocks的jacobian
+        e_blocks = [None for _ in self.residual_blocks]  # error = ls_weight * residual
+        cost_blocks = [None for _ in self.residual_blocks]  # cost = sum(loss(residual)) (residual可以是向量,例如se(3))
 
         block_cidx_dict = dict(zip(self.param_dict.keys(),
-                                   list(range(len(self.param_dict)))))
+                                   list(range(len(self.param_dict)))))  # 每个param在H_blocks中对应的column idx (not H^T)
 
         if self.options.num_threads > 1:
-            # Evaluate residual and jacobian blocks in parallel
+            # Evaluate residual and jacobian blocks in parallel and populate results to HT_blocks, e_blocks, cost_blocks
             threads = []
             for block_ridx, (block, keys, loss) in \
                 enumerate(zip(self.residual_blocks,
                               self.block_param_keys,
                               self.block_loss_functions)):
-
+                # block_ridx是每个residual在H_blocks中对应的row idx (not H^T) -- 用于填充HT_blocks
                 threads.append(self._thread_pool.submit(
                     self._populate_residual_jacobian_and_cost_blocks,
                     HT_blocks, e_blocks, cost_blocks,
@@ -326,12 +363,12 @@ class Problem:
                     block_cidx_dict, block_ridx,
                     block, keys, loss)
 
-        HT = sparse.bmat(HT_blocks, format='csr')
-        e = np.squeeze(np.bmat(e_blocks).A)
+        HT = sparse.bmat(HT_blocks, format='csr')  # elements in HT_blocks are csr_matrix (Compressed Sparse Row matrix)
+        e = np.squeeze(np.bmat(e_blocks).A)  # ls_weight * residual (residual = stiffness * raw_residual)
 
-        precision = HT.dot(HT.T)
-        information = -HT.dot(e)
-        cost = np.sum(np.array(cost_blocks))
+        precision = HT.dot(HT.T)  # J^T * J
+        information = -HT.dot(e)  # -J^T * error
+        cost = np.sum(np.array(cost_blocks))  # sum of all sum(loss(residual))
 
         return precision, information, cost
 
@@ -342,19 +379,25 @@ class Problem:
         params = [self.param_dict[key] for key in keys]
         compute_jacobians = [False if key in self.constant_param_keys
                              else True for key in keys]
-
-        # Drop the residual if all the parameters used to compute it are
-        # being held constant
+        """ Populate the evaluation results (residual, cost, jacobian) to the total matrix
+        This method is usually run in parallel to do the population
+        
+        Args:
+        """
+        # Drop the residual if all the parameters used to compute it are being held constant
         if any(compute_jacobians):
             residual, jacobians = block.evaluate(params, compute_jacobians)
-            # Weight for iteratively reweighted least squares
+            # Weight for iteratively reweighted least squares (IRLS)
+            # If other loss rather than L2Loss is used, one should reweight each residual accordingly
+            # to keep all variances the same
             sqrt_loss_weight = np.sqrt(loss.weight(residual))
 
+            # populate the block result to HT_blocks, cost_blocks, e_blocks
             for key, jac in zip(keys, jacobians):
                 if jac is not None:
-                    # transposes needed for proper broadcasting
+                    # transposes needed for proper broadcasting (sqrt_loss_weight.T * jac.T)
                     HT_blocks[block_cidx_dict[key]][block_ridx] = \
-                        sparse.csr_matrix(sqrt_loss_weight.T * jac.T)
+                        sparse.csr_matrix(sqrt_loss_weight.T * jac.T)  # assign the jacobian (as csr_matrix) to HT_block
 
             cost_blocks[block_ridx] = np.sum(loss.loss(residual))
             e_blocks[block_ridx] = sqrt_loss_weight * residual
@@ -403,7 +446,7 @@ class Problem:
             param_dict = self.param_dict
 
         try:
-            param_dict[key].perturb(dx)
+            param_dict[key].perturb(dx)  # update in tangent space
         except AttributeError:
-            # Default vector space behaviour
+            # Default vector space behaviour (euclidean space)
             param_dict[key] += dx
